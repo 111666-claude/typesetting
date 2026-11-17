@@ -150,6 +150,7 @@ func (t *HarfbuzzShaper) shape(input Input, skipExtents bool) Output {
 		glyphs[i].YBearing = fixed.I(int(extents.YBearing)) >> scaleShift
 	}
 	countClusters(glyphs, input.RunEnd, input.Direction.Progression())
+	markTabGlyphs(runes, input.RunStart, input.RunEnd, glyphs)
 	out := Output{
 		Glyphs:    glyphs,
 		Direction: input.Direction,

@@ -457,6 +457,23 @@ type WrapConfig struct {
 	// usually want this feature enabled, but for text editors it is frequently
 	// desirable to allow trailing whitespace to occupy space itself.
 	DisableTrailingWhitespaceTrim bool
+	// TabStops configures the tab stops used to position text following tab
+	// characters ('\t', U+0009). When the slice is empty, tabs are shaped and
+	// wrapped like ordinary characters and the layout is unchanged.
+	//
+	// Stops are distances from the leading edge of every line, so column
+	// positions remain stable across wrapped lines and font changes. The
+	// slice does not need to be sorted: the wrapper sorts it, drops
+	// non-positive positions and keeps the first stop when several share a
+	// position. A tab moves to the first stop strictly after the current
+	// position; consecutive tabs therefore consume successive stops. A tab
+	// with no remaining stop produces no movement. Stops beyond the line
+	// width are simply never reached and cannot force an overflow.
+	//
+	// Tab characters themselves never produce a visible glyph: their shaper
+	// glyph is replaced by an empty glyph whose advance is the distance to
+	// the resolved position.
+	TabStops []TabStop
 }
 
 // LineBreakPolicy specifies when considering a line break within a "word" or UAX#14
@@ -761,6 +778,14 @@ type LineWrapper struct {
 	lineStartRune int
 	// more indicates that the iteration API has more data to return.
 	more bool
+
+	// tabStops is the normalized content of config.TabStops, nil when tabs
+	// are disabled.
+	tabStops []TabStop
+	// currentMaxWidth is the max width of the line currently being built.
+	// Tab stops beyond it are unreachable and collapse. It is set by
+	// WrapNextLineF and read when resolving the final line.
+	currentMaxWidth fixed.Int26_6
 }
 
 // Prepare initializes the LineWrapper for the given paragraph and shaped text.
@@ -783,6 +808,7 @@ func (l *LineWrapper) Prepare(config WrapConfig, paragraph []rune, runs RunItera
 // or [LineWrapper.WrapParagraph].
 func (l *LineWrapper) PrepareSegmented(config WrapConfig, seg *segmenter.Segmenter, runs RunIterator) {
 	l.config = config
+	l.tabStops = normalizeTabStops(config.TabStops)
 	l.truncating = l.config.TruncateAfterLines > 0
 	l.breaker = newBreaker(seg)
 	l.glyphRuns = runs
@@ -815,6 +841,9 @@ func (l *LineWrapper) WrapParagraph(config WrapConfig, maxWidth int, paragraph [
 // WrapParagraphF is the same as [WrapParagraph], but accepts a non integer [maxWidth].
 func (l *LineWrapper) WrapParagraphF(config WrapConfig, maxWidth fixed.Int26_6, paragraph []rune, runs RunIterator) (_ []Line, truncated int) {
 	l.scratch.reset()
+	// Normalize the tab stops up front so the single-run fast path below
+	// knows whether tabs are active. PrepareSegmented reuses the result.
+	l.tabStops = normalizeTabStops(config.TabStops)
 	// Check whether we can skip line wrapping altogether for the simple single-run-that-fits case.
 	if !(config.TextContinues && config.TruncateAfterLines == 1) {
 		runs.Save()
@@ -837,7 +866,7 @@ func (l *LineWrapper) WrapParagraphF(config WrapConfig, maxWidth fixed.Int26_6, 
 		if !hasMandatoryBreak {
 			_, firstRun, hasFirst := runs.Next()
 			_, _, hasSecond := runs.Peek()
-			if hasFirst && !hasSecond {
+			if hasFirst && !hasSecond && !(l.tabStops != nil && runHasTabs(firstRun)) {
 				if firstRun.Advance <= maxWidth {
 					return l.scratch.singleRunParagraph(firstRun), 0
 				}
@@ -1048,12 +1077,28 @@ func (l *LineWrapper) postProcessLine(finalLine Line, done bool) (WrappedLine, b
 		}
 	}
 
+	// Resolve tab characters against the configured stops once the final line
+	// content (including a possible truncator) is known.
+	if l.tabStops != nil {
+		l.applyTabStops(finalLine)
+	}
+
 	// Mark the paragraph as complete if needed.
 	if done {
 		l.more = false
 	}
 
 	return WrappedLine{finalLine, truncated, l.lineStartRune, trimmed}, done
+}
+
+// applyTabStops replaces the tab glyphs of line with invisible glyphs whose
+// advances position the following text at the resolved tab stops.
+func (l *LineWrapper) applyTabStops(line Line) {
+	builder := newTabLineBuilder(l.tabStops, l.config.Direction, l.currentMaxWidth)
+	for i := range line {
+		builder.appendRun(&line[i])
+	}
+	builder.apply()
 }
 
 // WrapNextLine wraps the shaped glyphs of a paragraph to a particular max width.
@@ -1098,6 +1143,7 @@ func (l *LineWrapper) WrapNextLineF(maxWidth fixed.Int26_6) (out WrappedLine, do
 	if !hasFirst {
 		return WrappedLine{}, true
 	}
+	l.currentMaxWidth = maxWidth
 	l.scratch.startLine()
 
 	config := lineConfig{
@@ -1253,6 +1299,23 @@ const (
 	cannotFit
 )
 
+// candidateWidth returns the main-axis width of the current line candidate.
+// When tab stops are configured, the candidate is measured as if tab glyphs
+// had no intrinsic advance and were resolved against the configured stops;
+// otherwise it is the sum of the run advances with trailing whitespace
+// handling.
+func (l *LineWrapper) candidateWidth(candidateRun Output, maxWidth fixed.Int26_6) fixed.Int26_6 {
+	if l.tabStops == nil {
+		return candidateRun.advanceSpaceAware(l.config.Direction) + l.scratch.candidateAdvance()
+	}
+	builder := newTabLineBuilder(l.tabStops, l.config.Direction, maxWidth)
+	for i := range l.scratch.alt {
+		builder.appendRun(&l.scratch.alt[i])
+	}
+	builder.appendRun(&candidateRun)
+	return builder.width(l.config.Direction, !l.config.DisableTrailingWhitespaceTrim)
+}
+
 // processBreakOption evaluates whether the provided breakOption can fit onto the current line wrapping line.
 func (l *LineWrapper) processBreakOption(option breakOption, config lineConfig) (processBreakResult, Output) {
 	// Discard break options on previous lines.
@@ -1271,7 +1334,7 @@ func (l *LineWrapper) processBreakOption(option breakOption, config lineConfig) 
 	}
 	isFirstInLine := l.scratch.candidateLen() == 0
 	candidateRun := cutRun(run, l.mapper.mapping, l.lineStartRune, option.breakAtRune, isFirstInLine)
-	candidateLineWidth := candidateRun.advanceSpaceAware(l.config.Direction) + l.scratch.candidateAdvance()
+	candidateLineWidth := l.candidateWidth(candidateRun, config.maxWidth)
 	if candidateLineWidth > config.maxWidth {
 		// The run doesn't fit on the line.
 		if !l.scratch.hasBest() {

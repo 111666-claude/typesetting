@@ -72,6 +72,12 @@ type Glyph struct {
 	// The line wrapper will ignore [endLetterSpacing] when deciding where to break,
 	// and will trim [startLetterSpacing] at the start of the lines
 	startLetterSpacing, endLetterSpacing fixed.Int26_6
+
+	// isTab is true when the runes of this cluster contain a tab character
+	// (U+0009). It is only consulted by the line wrapper when tab stops are
+	// configured in [WrapConfig]; shaped output keeps its default metrics
+	// otherwise.
+	isTab bool
 }
 
 // TextIndex is the lowest rune index of all runes shaped into
