@@ -100,6 +100,97 @@ func FuzzE2EVariableSize(f *testing.F) {
 	})
 }
 
+// fuzzHyphenator derives deterministic but deliberately messy break
+// opportunities from each word: it includes interior offsets, but also
+// duplicates, out-of-range values and unsorted order to exercise the wrapper's
+// validation. The exact pattern is a pure function of word content, so the same
+// word always receives the same opportunities.
+type fuzzHyphenator struct{}
+
+func (fuzzHyphenator) BreakOpportunities(word []rune, wordOffset int) []int {
+	if len(word) <= 2 {
+		return nil
+	}
+	var out []int
+	for i := 1; i < len(word); i++ {
+		// Only alphabetic-like interior positions are candidates.
+		out = append(out, i)
+		if i%3 == 0 {
+			out = append(out, i) // duplicate
+		}
+		if i%4 == 0 {
+			out = append(out, i-2) // unsorted relative entry
+		}
+	}
+	// Inject illegal indices that must be ignored.
+	out = append(out, 0, len(word), -1, len(word)+5)
+	return out
+}
+
+// FuzzHyphenation shapes and wraps text with hyphenation enabled, verifying
+// that every source rune is still accounted for exactly once and that no
+// hyphenated line overflows the requested width.
+func FuzzHyphenation(f *testing.F) {
+	face := loadOpentypeFont(f, "../font/testdata/Roboto-Regular.ttf")
+	var shaper HarfbuzzShaper
+	hyphen := shaper.Shape(Input{
+		Text:      []rune("-"),
+		RunStart:  0,
+		RunEnd:    1,
+		Direction: di.DirectionLTR,
+		Face:      face,
+		Size:      fixed.I(16),
+		Script:    language.Latin,
+	})
+	f.Add(benchParagraphLatin, byte(120))
+	f.Add("internationalization", byte(40))
+	f.Add("a", byte(1))
+	f.Fuzz(func(t *testing.T, input string, widthByte byte) {
+		textInput := []rune(input)
+		if len(textInput) == 0 {
+			return
+		}
+		out := []Output{shaper.Shape(Input{
+			Text:      textInput,
+			RunStart:  0,
+			RunEnd:    len(textInput),
+			Direction: di.DirectionLTR,
+			Face:      face,
+			Size:      fixed.I(16),
+			Script:    language.Latin,
+		})}
+		maxWidth := int(widthByte)
+		var l LineWrapper
+		lines, _ := l.WrapParagraph(
+			WrapConfig{BreakPolicy: Never, Hyphenator: fuzzHyphenator{}, Hyphen: hyphen},
+			maxWidth, textInput, NewSliceIterator(out),
+		)
+		totalRunes := 0
+		for lineIdx, line := range lines {
+			hasHyphen := false
+			var lineAdvance fixed.Int26_6
+			for _, run := range line {
+				lineAdvance += run.Advance
+				if run.Runes.Count == 0 {
+					hasHyphen = true
+					continue
+				}
+				if run.Runes.Offset != totalRunes {
+					t.Errorf("line %d: expected rune offset %d, got %d", lineIdx, totalRunes, run.Runes.Offset)
+				}
+				totalRunes += run.Runes.Count
+			}
+			// A line that actually carries a hyphen must fit within the width.
+			if hasHyphen && lineAdvance > fixed.I(maxWidth) {
+				t.Errorf("line %d with hyphen overflows: %d > %d", lineIdx, lineAdvance, maxWidth)
+			}
+		}
+		if totalRunes != len(textInput) {
+			t.Errorf("mismatched runes! expected %d, got %d", len(textInput), totalRunes)
+		}
+	})
+}
+
 func FuzzBreakOptions(f *testing.F) {
 	f.Add(string([]rune{183067, 318808839, 476266048}))
 	f.Add(benchParagraphArabic)

@@ -301,6 +301,20 @@ type breaker struct {
 	isUnusedWord        bool
 	unusedGraphemeBreak breakOption
 	isUnusedGrapheme    bool
+
+	// currentSegmentOffset and currentSegmentText hold the UAX#14 line segment
+	// ending at the most recently produced word break option. The segment spans
+	// the runes between the previous word break and the current one, and is the
+	// "word" handed to the [Hyphenator].
+	currentSegmentOffset int
+	currentSegmentText   []rune
+
+	// hyphenCache holds the validated, sorted and de-duplicated hyphenation
+	// break opportunities (absolute rune indices) computed for the segment
+	// starting at hyphenCacheOffset. A nil slice means that the segment has no
+	// usable opportunities.
+	hyphenCacheOffset int
+	hyphenCache       []int
 }
 
 // newBreaker returns a breaker for the text seg has been initialized with.
@@ -310,6 +324,7 @@ func newBreaker(seg *segmenter.Segmenter) *breaker {
 		wordSegmenter:     seg.LineIterator(),
 		graphemeSegmenter: seg.GraphemeIterator(),
 		totalRunes:        seg.Len(),
+		hyphenCacheOffset: -1,
 	}
 	return br
 }
@@ -327,6 +342,8 @@ func (b *breaker) nextWordRaw() (option breakOption, ok bool) {
 			// the end of text input anyway.
 			required: currentSegment.IsMandatoryBreak && breakAtRune != b.totalRunes-1,
 		}
+		b.currentSegmentOffset = currentSegment.Offset
+		b.currentSegmentText = currentSegment.Text
 		return option, true
 	}
 	// Unicode rules impose to always break at the end
@@ -413,6 +430,39 @@ func (l *breaker) markGraphemeOptionUnused() {
 	l.isUnusedGrapheme = true
 }
 
+// hyphenOpportunities returns the validated hyphenation break opportunities for
+// the current UAX#14 segment, as absolute rune indices, sorted in ascending
+// order. The result is cached per segment. A nil (or empty) result means that
+// the segment cannot be hyphenated: either no [Hyphenator] is configured, the
+// segment is empty, or the Hyphenator returned no opportunity inside the word.
+func (b *breaker) hyphenOpportunities(hyphenator Hyphenator) []int {
+	if hyphenator == nil || len(b.currentSegmentText) == 0 {
+		return nil
+	}
+	if b.hyphenCacheOffset == b.currentSegmentOffset {
+		return b.hyphenCache
+	}
+	b.hyphenCacheOffset = b.currentSegmentOffset
+	b.hyphenCache = b.hyphenCache[:0]
+
+	wordLen := len(b.currentSegmentText)
+	seen := make(map[int]bool)
+	for _, offset := range hyphenator.BreakOpportunities(b.currentSegmentText, b.currentSegmentOffset) {
+		// Reject illegal indices and the first/last positions: a hyphenation
+		// break must leave at least one rune on each side of the break.
+		if offset <= 0 || offset >= wordLen || seen[offset] {
+			continue
+		}
+		seen[offset] = true
+		// An offset n means word[:n] stays on the line and word[n:] wraps, so
+		// the break is after the rune at (relative) index n-1. Convert it to
+		// the absolute breakAtRune convention used by breakOption.
+		b.hyphenCache = append(b.hyphenCache, b.currentSegmentOffset+offset-1)
+	}
+	sort.Ints(b.hyphenCache)
+	return b.hyphenCache
+}
+
 // Range indicates the location of a sequence of elements within a longer slice.
 type Range struct {
 	Offset int
@@ -457,6 +507,17 @@ type WrapConfig struct {
 	// usually want this feature enabled, but for text editors it is frequently
 	// desirable to allow trailing whitespace to occupy space itself.
 	DisableTrailingWhitespaceTrim bool
+	// Hyphenator, if non-nil, provides break opportunities inside words that the
+	// wrapper uses when the regular UAX#14 line break opportunities are not enough
+	// to fill a line. Hyphen must also be set for hyphenation to take effect.
+	// Hyphenation is never applied to RTL segments.
+	Hyphenator Hyphenator
+	// Hyphen is a shaped run containing the glyph drawn at the end of a line that
+	// ends with a hyphenated word. It is only drawn on a line where a hyphenation
+	// break is actually taken, and its [Range] is managed by the wrapper: it covers
+	// no source runes so that source rune indices and the glyph cluster mapping of
+	// the following line stay unchanged.
+	Hyphen Output
 }
 
 // LineBreakPolicy specifies when considering a line break within a "word" or UAX#14
@@ -489,10 +550,38 @@ func (l LineBreakPolicy) String() string {
 	}
 }
 
+// Hyphenator provides optional break opportunities within words, allowing the
+// line wrapper to split a long word across two lines and draw a hyphen at the
+// break point.
+//
+// BreakOpportunities is called once per UAX#14 line segment (roughly a "word"
+// plus its trailing punctuation and spaces) with the runes of the segment and
+// its absolute rune offset within the paragraph. It returns the positions,
+// relative to word, at which the word may be split. A returned offset n means
+// that word[:n] stays at the end of the current line and word[n:] starts the
+// next one; it must satisfy 0 < n < len(word). Offsets outside of this range
+// are ignored, so an implementation does not need to validate its output.
+// Duplicate and unsorted offsets are tolerated. Returning no offsets disables
+// hyphenation for the word and the wrapper falls back to its regular breaking.
+//
+// The wrapper only consults a Hyphenator when the regular UAX#14 break
+// opportunities are insufficient, and it never hyphenates RTL segments.
+type Hyphenator interface {
+	BreakOpportunities(word []rune, wordOffset int) []int
+}
+
 // WithTruncator returns a copy of WrapConfig with the Truncator field set to the
 // result of shaping input with shaper.
 func (w WrapConfig) WithTruncator(shaper Shaper, input Input) WrapConfig {
 	w.Truncator = shaper.Shape(input)
+	return w
+}
+
+// WithHyphen returns a copy of WrapConfig with the Hyphen field set to the
+// result of shaping input with shaper. Hyphenation is only active when both the
+// Hyphen field and a Hyphenator are set.
+func (w WrapConfig) WithHyphen(shaper Shaper, input Input) WrapConfig {
+	w.Hyphen = shaper.Shape(input)
 	return w
 }
 
@@ -1128,6 +1217,7 @@ func (l *LineWrapper) restore() {
 // wrapper's scratch [WrapBuffer]. It returns whether the paragraph is finished once it has
 // successfully built a line.
 func (l *LineWrapper) wrapNextLine(config lineConfig) (done bool) {
+	hyphenationEnabled := l.config.Hyphenator != nil && len(l.config.Hyphen.Glyphs) > 0 && !config.truncating
 	for {
 		l.checkpoint()
 		option, ok := l.breaker.nextWordBreak()
@@ -1153,6 +1243,12 @@ func (l *LineWrapper) wrapNextLine(config lineConfig) (done bool) {
 			if !l.scratch.hasBest() {
 				l.scratch.markCandidateBest()
 			}
+			if hyphenationEnabled {
+				l.restore()
+				if l.tryHyphenation(option, config) {
+					return false
+				}
+			}
 			if l.config.BreakPolicy == Never {
 				return true
 			}
@@ -1162,11 +1258,20 @@ func (l *LineWrapper) wrapNextLine(config lineConfig) (done bool) {
 			// We found a valid line that didn't use this break, so mark that it can be
 			// reused on the next iteration.
 			l.breaker.markWordOptionUnused()
+			if hyphenationEnabled && l.tryHyphenation(option, config) {
+				return false
+			}
 			if l.config.BreakPolicy == Never || (l.config.BreakPolicy == WhenNecessary && !config.truncating) {
 				return false
 			}
 			// Fall through to try grapheme breaking.
 		case cannotFit:
+			if hyphenationEnabled {
+				l.restore()
+				if l.tryHyphenation(option, config) {
+					return false
+				}
+			}
 			if l.config.BreakPolicy == Never {
 				if config.truncating {
 					return true
@@ -1252,6 +1357,89 @@ const (
 	// this is left to higher-level logic.
 	cannotFit
 )
+
+// tryHyphenation attempts to end the current line at one of the Hyphenator's
+// break opportunities within the UAX#14 segment ending at option. It is only
+// invoked once the regular word break options proved insufficient.
+//
+// On success it commits the best candidate (the word fragment followed by the
+// configured hyphen run), marks the word break option as unused so that the
+// remainder of the segment is processed on the next line, and returns true.
+// On failure it restores the candidate line and run iterator to their state on
+// entry and returns false, leaving the regular grapheme-based fallback
+// untouched.
+func (l *LineWrapper) tryHyphenation(option breakOption, config lineConfig) bool {
+	if l.config.Hyphenator == nil || len(l.config.Hyphen.Glyphs) == 0 || config.truncating {
+		return false
+	}
+	opportunities := l.breaker.hyphenOpportunities(l.config.Hyphenator)
+	if len(opportunities) == 0 {
+		return false
+	}
+	// Hyphenation is only supported for LTR (including vertical) segments.
+	_, run, _ := l.glyphRuns.Peek()
+	if run.Direction.Progression() == di.TowardTopLeft {
+		return false
+	}
+
+	for i := len(opportunities) - 1; i >= 0; i-- {
+		l.checkpoint()
+		hyphenOption := breakOption{breakAtRune: opportunities[i]}
+		result, candidateRun := l.processHyphenOption(hyphenOption, config)
+		if result != fits {
+			l.restore()
+			continue
+		}
+		hyphenRun := l.config.Hyphen
+		// The hyphen represents no rune of the source text: it is a purely visual
+		// suffix. Anchor it just past the fragment's last rune so that rune
+		// accounting stays consistent without consuming any runes.
+		hyphenRun.Runes = Range{Offset: hyphenOption.breakAtRune + 1, Count: 0}
+		l.scratch.markCandidateBest(candidateRun, hyphenRun)
+		// The word break option ending this segment is still needed to process
+		// the remainder of the segment on the next line.
+		l.breaker.markWordOptionUnused()
+		return true
+	}
+	return false
+}
+
+// processHyphenOption evaluates whether a hyphenation breakOption can fit onto
+// the current line, counting both the word fragment and the configured hyphen
+// run against the available width. It mirrors [processBreakOption], but never
+// reports truncation: a fragment that does not fit simply causes the caller to
+// try a smaller fragment or fall back to grapheme breaking.
+func (l *LineWrapper) processHyphenOption(option breakOption, config lineConfig) (processBreakResult, Output) {
+	// Discard break options on previous lines.
+	if option.breakAtRune < l.lineStartRune {
+		return breakInvalid, Output{}
+	}
+
+	// Fill candidate line with runs until the run containing the break option.
+	l.fillUntil(l.glyphRuns, option)
+
+	currRunIndex, run, _ := l.glyphRuns.Peek()
+	l.mapper.mapRun(currRunIndex, run)
+	if !option.isValid(l.mapper.mapping, run) {
+		// Reject break candidates that would split a shaped glyph cluster.
+		return breakInvalid, Output{}
+	}
+	isFirstInLine := l.scratch.candidateLen() == 0
+	candidateRun := cutRun(run, l.mapper.mapping, l.lineStartRune, option.breakAtRune, isFirstInLine)
+	// Use the raw advance here rather than advanceSpaceAware: when a hyphen is
+	// appended, a trailing space inside the fragment is no longer visually
+	// trailing, so its width must still count toward the line.
+	candidateLineWidth := candidateRun.Advance +
+		l.scratch.candidateAdvance() + l.config.Hyphen.Advance
+	if candidateLineWidth > config.maxWidth {
+		// The fragment plus the hyphen does not fit on the line.
+		if !l.scratch.hasBest() {
+			return cannotFit, candidateRun
+		}
+		return newLineBeforeBreak, candidateRun
+	}
+	return fits, candidateRun
+}
 
 // processBreakOption evaluates whether the provided breakOption can fit onto the current line wrapping line.
 func (l *LineWrapper) processBreakOption(option breakOption, config lineConfig) (processBreakResult, Output) {
