@@ -457,6 +457,12 @@ type WrapConfig struct {
 	// usually want this feature enabled, but for text editors it is frequently
 	// desirable to allow trailing whitespace to occupy space itself.
 	DisableTrailingWhitespaceTrim bool
+	// HangingPunctuation optionally allows configured punctuation glyphs at the
+	// edges of a line to hang outside the text frame, relaxing the width
+	// constraint accordingly. The zero value disables the feature, in which
+	// case the wrapped output is strictly identical to a wrapper without it.
+	// See [HangingPunctuation] for details.
+	HangingPunctuation HangingPunctuation
 }
 
 // LineBreakPolicy specifies when considering a line break within a "word" or UAX#14
@@ -749,6 +755,15 @@ type LineWrapper struct {
 	// breaker provides line-breaking candidates.
 	breaker *breaker
 
+	// hanging is the compiled form of config.HangingPunctuation.
+	hanging hangingPunctuation
+	// text is the paragraph being wrapped, shared with the segmenter. It is
+	// used to resolve glyph clusters back to runes for hanging punctuation.
+	text []rune
+	// edgeRuns is a scratch buffer used to evaluate hanging punctuation
+	// across run boundaries.
+	edgeRuns []Output
+
 	// scratch holds wrapping algorithm storage buffers for reuse.
 	scratch wrapBuffer
 
@@ -785,6 +800,8 @@ func (l *LineWrapper) PrepareSegmented(config WrapConfig, seg *segmenter.Segment
 	l.config = config
 	l.truncating = l.config.TruncateAfterLines > 0
 	l.breaker = newBreaker(seg)
+	l.hanging = newHangingPunctuation(config.HangingPunctuation)
+	l.text = seg.Text()
 	l.glyphRuns = runs
 	l.lineStartRune = 0
 	l.more = true
@@ -916,6 +933,21 @@ type WrappedLine struct {
 	// It is zero if [DisableTrailingWhitespaceTrim] is set to true,
 	// or if there is no whitespace at the end of the line.
 	TrimmedTrailingWhitespace fixed.Int26_6
+
+	// StartOverhang is the distance by which hanging punctuation at the
+	// leading edge of the line (in reading order) protrudes beyond the text
+	// frame. To visually align the line's content with the other lines, the
+	// caller may shift the whole line toward its leading edge by this
+	// amount. It is zero when hanging punctuation is disabled (see
+	// [WrapConfig.HangingPunctuation]) or when no configured punctuation
+	// leads the line.
+	StartOverhang fixed.Int26_6
+	// EndOverhang is the distance by which the line visually overflows the
+	// text frame at its trailing edge (in reading order) through hanging
+	// punctuation. It never exceeds the allowance granted by
+	// [WrapConfig.HangingPunctuation], and is zero for lines which do not
+	// fill the frame.
+	EndOverhang fixed.Int26_6
 }
 
 // reverseVisualOrder reflects the visual indices of line[start:end].
@@ -972,8 +1004,9 @@ func computeBidiOrdering(finalLine Line) {
 	}
 }
 
-func (l *LineWrapper) postProcessLine(finalLine Line, done bool) (WrappedLine, bool) {
+func (l *LineWrapper) postProcessLine(finalLine Line, done bool, maxWidth fixed.Int26_6) (WrappedLine, bool) {
 	var trimmed fixed.Int26_6
+	var startOverhang, endOverhang fixed.Int26_6
 	if len(finalLine) > 0 {
 		computeBidiOrdering(finalLine)
 		if !l.config.DisableTrailingWhitespaceTrim {
@@ -1016,6 +1049,9 @@ func (l *LineWrapper) postProcessLine(finalLine Line, done bool) (WrappedLine, b
 				trimmed = beforeTrim - finalVisualRun.Advance
 			}
 		}
+		if l.hanging.enabled {
+			startOverhang, endOverhang = l.lineOverhangs(finalLine, maxWidth)
+		}
 
 		finalLogicalRun := finalLine[len(finalLine)-1]
 		// Update the start position of the next line.
@@ -1050,7 +1086,14 @@ func (l *LineWrapper) postProcessLine(finalLine Line, done bool) (WrappedLine, b
 		l.more = false
 	}
 
-	return WrappedLine{finalLine, truncated, l.lineStartRune, trimmed}, done
+	return WrappedLine{
+		Line:                      finalLine,
+		Truncated:                 truncated,
+		NextLine:                  l.lineStartRune,
+		TrimmedTrailingWhitespace: trimmed,
+		StartOverhang:             startOverhang,
+		EndOverhang:               endOverhang,
+	}, done
 }
 
 // WrapNextLine wraps the shaped glyphs of a paragraph to a particular max width.
@@ -1087,7 +1130,7 @@ func (l *LineWrapper) WrapNextLineF(maxWidth fixed.Int26_6) (out WrappedLine, do
 	}
 
 	defer func() {
-		out, done = l.postProcessLine(out.Line, done)
+		out, done = l.postProcessLine(out.Line, done, maxWidth)
 	}()
 
 	// If the iterator is empty, return early.
@@ -1269,6 +1312,14 @@ func (l *LineWrapper) processBreakOption(option breakOption, config lineConfig) 
 	isFirstInLine := l.scratch.candidateLen() == 0
 	candidateRun := cutRun(run, l.mapper.mapping, l.lineStartRune, option.breakAtRune, isFirstInLine)
 	candidateLineWidth := candidateRun.advanceSpaceAware(l.config.Direction) + l.scratch.candidateAdvance()
+	if l.hanging.enabled {
+		// Hanging punctuation at the line edges is allowed to overflow the
+		// frame, so its allowance does not count against the line width.
+		l.edgeRuns = append(l.edgeRuns[:0], l.scratch.alt...)
+		l.edgeRuns = append(l.edgeRuns, candidateRun)
+		candidateLineWidth -= l.hanging.edgeHangOf(l.edgeRuns, l.config.Direction, l.text, false)
+		candidateLineWidth -= l.hanging.edgeHangOf(l.edgeRuns, l.config.Direction, l.text, true)
+	}
 	if candidateLineWidth > config.maxWidth {
 		// The run doesn't fit on the line.
 		if !l.scratch.hasBest() {
