@@ -433,11 +433,18 @@ type WrapConfig struct {
 	// provided to the segmenter.
 	Direction di.Direction
 	// TruncateAfterLines is the number of lines of text to allow before truncating
-	// the text. A value of zero means no limit.
+	// the text. A value of zero means no limit: the paragraph is wrapped without
+	// truncating, regardless of the other truncation fields.
 	TruncateAfterLines int
-	// Truncator, if provided, will be inserted at the end of a truncated line. This
-	// feature is only active if TruncateAfterLines is nonzero. See the documentation
-	// for [LineWrapper.WrapNextLine] for details about how this works.
+	// Truncator, if provided, will be shaped into a marker (commonly "…") and
+	// inserted at the visual end of the final line when text is truncated. This
+	// feature is only active if TruncateAfterLines is nonzero. An empty Truncator
+	// (one with no shaped glyphs) is equivalent to not providing one: the line
+	// count is still limited and the hidden runes are still reported, but no
+	// marker is appended. When the marker itself is wider than the available line
+	// width, it is not inserted and the line keeps as much text as the width
+	// permits. See the documentation for [LineWrapper.WrapNextLine] for details
+	// about how this works.
 	Truncator Output
 	// TextContinues indicates that the paragraph wrapped by this config is not the
 	// final paragraph in the text. This alters text truncation when filling the
@@ -756,6 +763,15 @@ type LineWrapper struct {
 	mapper runMapper
 	// glyphRuns holds the runs of shaped text being wrapped.
 	glyphRuns RunIterator
+	// truncatorFits records whether the configured truncator is narrow enough
+	// to occupy part of the line on the final truncated line. When it does not
+	// fit, the line is truncated without a marker so that the visible content
+	// respects maxWidth.
+	truncatorFits bool
+	// truncatorHasGlyphs records whether the configured truncator contains any
+	// shaped glyphs. An empty truncator reserves width like a zero-width marker
+	// (preserving the historical layout) but is never appended to a line.
+	truncatorHasGlyphs bool
 	// lineStartRune is the rune index of the first rune on the next line to
 	// be shaped.
 	lineStartRune int
@@ -796,7 +812,9 @@ func (l *LineWrapper) PrepareSegmented(config WrapConfig, seg *segmenter.Segment
 // It is equivalent to iteratively invoking WrapLine with a constant maxWidth.
 // If the config has a non-zero TruncateAfterLines, WrapParagraph will return at most
 // that many lines. The truncated return value is the count of runes truncated from
-// the end of the text. The returned lines are only valid until the next call to
+// the end of the text; the same range is available (with its absolute offset) on the
+// final [WrappedLine].TruncatedRange when using [LineWrapper.WrapNextLine] directly.
+// The returned lines are only valid until the next call to
 // [*LineWrapper.WrapParagraph] or [*LineWrapper.Prepare].
 //
 // See [(*LineWrapper).WrapNextLine] for a description of how [WrapConfig]'s truncation
@@ -909,6 +927,15 @@ type WrappedLine struct {
 	// Truncated is the count of runes truncated from the end of the line,
 	// if this line was truncated.
 	Truncated int
+	// TruncatedRange is the range of the original paragraph runes that are no
+	// longer visible because of truncation. It is the zero [Range] when this line
+	// was not truncated. When non-zero, it always describes a contiguous suffix
+	// of the paragraph starting right after the last visible rune and ending at
+	// the end of the paragraph (including any hard line breaks and shaped runs
+	// hidden within it), so TruncatedRange.Offset+TruncatedRange.Count equals the
+	// length of the paragraph. The offset is absolute within the paragraph passed
+	// to [LineWrapper.Prepare].
+	TruncatedRange Range
 	// NextLine is the indice (in the input text slice) of the begining
 	// of the next line. It will equal len(text) if all the text
 	// fit in one line.
@@ -1030,13 +1057,18 @@ func (l *LineWrapper) postProcessLine(finalLine Line, done bool) (WrappedLine, b
 
 	// Implement truncation if needed.
 	truncated := 0
+	var truncatedRange Range
 	if l.truncating {
 		l.config.TruncateAfterLines--
 		insertTruncator := false
 		if l.config.TruncateAfterLines == 0 {
 			done = true
 			truncated = l.breaker.totalRunes - l.lineStartRune
-			insertTruncator = truncated > 0 || l.config.TextContinues
+			insertTruncator = (truncated > 0 || l.config.TextContinues) &&
+				l.truncatorFits && l.truncatorHasGlyphs
+			if truncated > 0 {
+				truncatedRange = Range{Offset: l.lineStartRune, Count: truncated}
+			}
 		}
 		if insertTruncator {
 			truncator := l.config.Truncator
@@ -1053,7 +1085,13 @@ func (l *LineWrapper) postProcessLine(finalLine Line, done bool) (WrappedLine, b
 		l.more = false
 	}
 
-	return WrappedLine{finalLine, truncated, l.lineStartRune, trimmed}, done
+	return WrappedLine{
+		Line:                      finalLine,
+		Truncated:                 truncated,
+		TruncatedRange:            truncatedRange,
+		NextLine:                  l.lineStartRune,
+		TrimmedTrailingWhitespace: trimmed,
+	}, done
 }
 
 // WrapNextLine wraps the shaped glyphs of a paragraph to a particular max width.
@@ -1067,11 +1105,20 @@ func (l *LineWrapper) postProcessLine(finalLine Line, done bool) (WrappedLine, b
 // If the LineWrapper's [WrapConfig].TruncateAfterLines
 // is non-zero, the final line of text returned by successive calls to WrapNextLine
 // may be truncated. The quantity of runes truncated by wrapping the line is
-// returned in [WrappedLine].Truncated. If this is non-zero AND the LineWrapper's
-// [WrapConfig].Truncator is set, the final line will end with an extra [Output].
+// returned in [WrappedLine].Truncated and the absolute rune range removed from the
+// original paragraph is returned in [WrappedLine].TruncatedRange. If truncation
+// occurred AND the LineWrapper's [WrapConfig].Truncator is both set and narrow
+// enough to fit on the line, the final line ends with an extra [Output].
 // [Output]s before the final [Output] will represent the input runes that are still
 // visible before truncation, and the final [Output] will be a copy of the Truncator
 // with its Runes.Count set to the quantity of runes truncated during line wrapping.
+// If the Truncator is wider than maxWidth, it cannot share the line with any text
+// without violating the width constraint, so it is omitted: the line is filled with
+// as much text as maxWidth permits and TruncatedRange still reports the hidden runes.
+//
+// Grapheme and shaping cluster boundaries are always respected: the wrapper only
+// removes whole clusters (never splitting a ligature, combining mark sequence or
+// font-fallback run), so TruncatedRange begins on a cluster boundary.
 //
 // See also [WrapNextLineF] which supports a decimal [maxWidth].
 func (l *LineWrapper) WrapNextLine(maxWidth int) (out WrappedLine, done bool) {
@@ -1100,10 +1147,22 @@ func (l *LineWrapper) WrapNextLineF(maxWidth fixed.Int26_6) (out WrappedLine, do
 	}
 	l.scratch.startLine()
 
+	// truncatorFits records whether a marker can share the final line. It is true
+	// when the truncator is empty or no wider than the line; an over-wide, non-empty
+	// marker is omitted instead of forcing every visible glyph off the line.
+	// truncatorHasGlyphs distinguishes a real marker (appended when truncation
+	// happens) from an empty one, which reserves no width and is never appended.
+	l.truncatorHasGlyphs = len(l.config.Truncator.Glyphs) > 0
+	l.truncatorFits = l.config.Truncator.Advance <= maxWidth
 	config := lineConfig{
 		truncating:        l.config.TruncateAfterLines == 1,
 		maxWidth:          maxWidth,
 		truncatedMaxWidth: maxWidth - l.config.Truncator.Advance,
+	}
+	if l.truncatorHasGlyphs && !l.truncatorFits {
+		// The marker cannot fit, so do not reserve room for it: fill the line with
+		// as much text as the full maxWidth permits and omit the marker later.
+		config.truncatedMaxWidth = maxWidth
 	}
 	done = l.wrapNextLine(config)
 	finalLine := l.scratch.finalizeBest()

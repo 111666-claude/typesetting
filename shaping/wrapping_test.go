@@ -1852,7 +1852,7 @@ func TestWrappingTruncation(t *testing.T) {
 	untruncatedCount := len(outs)
 
 	for _, truncator := range []Output{
-		{}, // No truncator.
+		{}, // No truncator: an empty marker must be treated as "no marker".
 		shaper.Shape(Input{ // Multi-rune truncator.
 			Text:      []rune("..."),
 			RunStart:  0,
@@ -1874,6 +1874,7 @@ func TestWrappingTruncation(t *testing.T) {
 			Language:  language.NewLanguage("EN"),
 		}),
 	} {
+		hasMarker := len(truncator.Glyphs) > 0
 		for i := untruncatedCount + 1; i > 0; i-- {
 			wc := WrapConfig{
 				BreakPolicy:        Never,
@@ -1892,14 +1893,25 @@ func TestWrappingTruncation(t *testing.T) {
 				}
 				lastLine := newLines[len(newLines)-1]
 				lastRun := lastLine[len(lastLine)-1]
-				expected := truncator
-				expected.Runes = Range{
-					Offset: len(textInput) - truncated,
-					Count:  truncated,
-				}
-				expected.VisualIndex = lastRun.VisualIndex
-				if !reflect.DeepEqual(lastRun, expected) {
-					t.Errorf("expected truncator as last run")
+				if hasMarker {
+					expected := truncator
+					expected.Runes = Range{
+						Offset: len(textInput) - truncated,
+						Count:  truncated,
+					}
+					expected.VisualIndex = lastRun.VisualIndex
+					if !reflect.DeepEqual(lastRun, expected) {
+						t.Errorf("expected truncator as last run")
+					}
+				} else {
+					// With no marker, the final run is ordinary visible text and no
+					// zero-glyph run may be appended.
+					if len(lastRun.Glyphs) == 0 {
+						t.Errorf("empty truncator must not append a marker run")
+					}
+					if lastRun.Runes.Offset+lastRun.Runes.Count != len(textInput)-truncated {
+						t.Errorf("visible text must end right before the truncated suffix")
+					}
 				}
 			} else if i >= untruncatedCount {
 				if lineCount != untruncatedCount {
@@ -1909,14 +1921,20 @@ func TestWrappingTruncation(t *testing.T) {
 					t.Errorf("expected lines to indicate no truncation")
 				}
 			}
+			// The visible runes plus the truncated suffix always account for the
+			// whole paragraph; a marker run carries no extra source runes (its
+			// Runes fields alias the hidden suffix), so it is excluded from the sum.
 			runeCount := 0
 			for _, line := range newLines {
 				for _, run := range line {
+					if hasMarker && len(run.Glyphs) == len(truncator.Glyphs) {
+						continue
+					}
 					runeCount += run.Runes.Count
 				}
 			}
-			if runeCount != len(textInput) {
-				t.Errorf("expected %d runes total, got %d output", len(textInput), runeCount)
+			if runeCount != len(textInput)-truncated {
+				t.Errorf("expected %d visible runes, got %d output", len(textInput)-truncated, runeCount)
 			}
 		}
 	}
@@ -1975,6 +1993,14 @@ func TestWrappingTruncationEdgeCases(t *testing.T) {
 		forceTruncation bool
 		// expectedTruncated is the expected count of truncated runes.
 		expectedTruncated int
+		// expectMarker indicates whether the truncator Output is expected on the
+		// final line. It defaults to whether truncation (or forced continuation)
+		// happened; omitMarker explicitly suppresses it for markers that are too
+		// wide to fit the line.
+		expectMarker bool
+		// omitMarker marks a case in which truncation occurs but the marker cannot
+		// fit and is therefore not inserted.
+		omitMarker bool
 	}
 	for _, tc := range []testcase{
 		{
@@ -2070,13 +2096,17 @@ func TestWrappingTruncationEdgeCases(t *testing.T) {
 			expectedTruncated: 2,
 		},
 		{
+			// The five-rune truncator is wider than the whole 40-unit line, so it
+			// cannot share the line without overflowing. The line is truncated
+			// without a marker and keeps as many source runes as fit.
 			name:              "only run doesn't fit and truncator doesn't fit",
 			input:             "mm mmm",
 			wrapWidth:         40,
 			cutInto:           1,
 			maxLines:          1,
 			truncator:         "mmmmm",
-			expectedTruncated: 6,
+			expectedTruncated: 3,
+			omitMarker:        true,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -2109,8 +2139,8 @@ func TestWrappingTruncationEdgeCases(t *testing.T) {
 			} else {
 				outs = append(outs, out)
 			}
-			var l LineWrapper
-			lines, truncatedRunes := l.WrapParagraph(WrapConfig{
+			var wrapper LineWrapper
+			lines, truncatedRunes := wrapper.WrapParagraph(WrapConfig{
 				BreakPolicy:        Never,
 				Truncator:          trunc,
 				TruncateAfterLines: tc.maxLines,
@@ -2119,9 +2149,50 @@ func TestWrappingTruncationEdgeCases(t *testing.T) {
 			if truncatedRunes != tc.expectedTruncated {
 				t.Errorf("got %d truncated runes when truncation expectation was %d", truncatedRunes, tc.expectedTruncated)
 			}
-			lastLine := lines[len(lines)-1]
-			lastRun := lastLine[len(lastLine)-1]
-			shouldTruncate := (tc.expectedTruncated > 0 || tc.forceTruncation)
+			// Drive the iterator API as well so that TruncatedRange can be checked.
+			copied := make([]Output, len(outs))
+			for i, o := range outs {
+				copied[i] = o.copy()
+			}
+			var wrapper2 LineWrapper
+			wrapper2.Prepare(WrapConfig{
+				BreakPolicy:        Never,
+				Truncator:          trunc,
+				TruncateAfterLines: tc.maxLines,
+				TextContinues:      tc.forceTruncation,
+			}, inputRunes, NewSliceIterator(copied))
+			var lastLine WrappedLine
+			for {
+				wl, done := wrapper2.WrapNextLine(tc.wrapWidth)
+				if wl.Line != nil {
+					lastLine = wl
+				}
+				if done {
+					break
+				}
+			}
+			// The reported range must describe the exact contiguous suffix removed.
+			wantRange := Range{}
+			if tc.expectedTruncated > 0 {
+				wantRange = Range{
+					Offset: len(inputRunes) - tc.expectedTruncated,
+					Count:  tc.expectedTruncated,
+				}
+			}
+			if lastLine.TruncatedRange != wantRange {
+				t.Errorf("got TruncatedRange=%+v, want %+v", lastLine.TruncatedRange, wantRange)
+			}
+			finalLine := lines[len(lines)-1]
+			lastRun := finalLine[len(finalLine)-1]
+			shouldTruncate := (tc.expectedTruncated > 0 || tc.forceTruncation) && !tc.omitMarker
+			// Whatever the configuration, a line must never exceed the requested width.
+			lineWidth := fixed.Int26_6(0)
+			for _, run := range finalLine {
+				lineWidth += run.Advance
+			}
+			if lineWidth > fixed.I(tc.wrapWidth) {
+				t.Errorf("line width %v exceeds max width %d (runs=%d)", lineWidth, tc.wrapWidth, len(finalLine))
+			}
 			trunc.VisualIndex = lastRun.VisualIndex
 			trunc.Runes = Range{
 				Offset: len(inputRunes) - tc.expectedTruncated,
@@ -2129,6 +2200,13 @@ func TestWrappingTruncationEdgeCases(t *testing.T) {
 			}
 			if lastRunIsTruncator := reflect.DeepEqual(lastRun, trunc); lastRunIsTruncator != shouldTruncate {
 				t.Errorf("shouldTruncate = %v, but lastRunIsTruncator = %v", shouldTruncate, lastRunIsTruncator)
+			}
+			if tc.omitMarker {
+				for _, run := range finalLine {
+					if run.Glyphs != nil && len(run.Glyphs) == len(trunc.Glyphs) && run.Runes.Count == 0 {
+						t.Errorf("truncator marker unexpectedly present despite not fitting")
+					}
+				}
 			}
 		})
 	}
@@ -2810,19 +2888,20 @@ func TestLineWrapperBreakSpecific(t *testing.T) {
 					truncatedCount: 7,
 				},
 				{
-					// Since we can't wrap within words in this configuration, we truncate all runes.
+					// Since we can't wrap within words in this configuration, every text rune
+					// is truncated. The marker still fits on the line by itself.
 					name:           "Never-Truncate",
 					config:         WrapConfig{BreakPolicy: Never, TruncateAfterLines: 1},
-					runeCounts:     []int{},
+					runeCounts:     []int{0},
 					truncatedCount: 12,
 				},
 			},
 		},
 		{
-			// The first word "hello, " doesn't quite fit in 40 pixels. These tests exercise this boundary
-			// condition with various break policies and truncation policies.
 			paragraph: []rune("hello, world"),
-			maxWidth:  40,
+			// maxWidth of 40 with an empty truncator. With no marker glyphs the whole
+			// paragraph is truncated and no line is produced.
+			maxWidth: 40,
 			expectations: []expectation{
 				{
 					name:       "WhenNecessary",
@@ -2903,9 +2982,11 @@ func TestLineWrapperBreakSpecific(t *testing.T) {
 					runeCounts: []int{7, 5},
 				},
 				{
+					// With an empty truncator, every rune is truncated and no marker
+					// line is produced.
 					name:           "Never-Truncate",
 					config:         WrapConfig{BreakPolicy: Never, TruncateAfterLines: 1},
-					runeCounts:     []int{0},
+					runeCounts:     []int{},
 					truncatedCount: 12,
 				},
 				{
@@ -2990,9 +3071,13 @@ func TestLineWrapperBreakSpecific(t *testing.T) {
 					if truncated != expec.truncatedCount {
 						t.Errorf("expected %d truncated runes, got %d", expec.truncatedCount, truncated)
 					}
+					// An empty expectation means every rune was truncated and the
+					// (empty) truncator contributes no visible line.
+					if len(actualCounts) != len(expec.runeCounts) {
+						t.Errorf("expected %d lines, got %d", len(expec.runeCounts), len(actualCounts))
+					}
 					for lineNo, expected := range expec.runeCounts {
 						if len(actualCounts) <= lineNo {
-							t.Errorf("expected %d lines, got %d", len(expec.runeCounts), len(actualCounts))
 							break
 						}
 						actual := actualCounts[lineNo]
