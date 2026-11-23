@@ -35,6 +35,9 @@ func Test_serializeFootprints(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	for i := range got { // coverage indexes are not serialized
+		got[i].coverage = nil
+	}
 
 	if !reflect.DeepEqual(input, got) {
 		t.Fatalf("expected %v, got %v", input, got)
@@ -60,6 +63,17 @@ func assertFontsetEquals(expected, got []Footprint) error {
 	if len(expected) != len(got) {
 		return fmt.Errorf("invalid length: expected %d, got %d", len(expected), len(got))
 	}
+	// coverage indexes are derived, non serialized cache data: compare the
+	// footprint contents without them.
+	stripCoverage := func(in []Footprint) []Footprint {
+		out := make([]Footprint, len(in))
+		copy(out, in)
+		for i := range out {
+			out[i].coverage = nil
+		}
+		return out
+	}
+	expected, got = stripCoverage(expected), stripCoverage(got)
 	for i := range got {
 		expectedFootprint, gotFootprint := expected[i], got[i]
 		if !reflect.DeepEqual(expectedFootprint, gotFootprint) {

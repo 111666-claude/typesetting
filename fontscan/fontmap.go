@@ -477,10 +477,10 @@ func (fm *FontMap) buildCandidates() {
 // returns nil if not candidates supports the rune `r`
 func (fm *FontMap) resolveForRune(candidates []int, r rune) *font.Face {
 	for _, footprintIndex := range candidates {
-		// check the coverage
-		if fp := fm.database[footprintIndex]; fp.Runes.Contains(r) {
+		// check the coverage through the shared immutable index
+		if fp := &fm.database[footprintIndex]; fp.coversRune(r) {
 			// try to use the font
-			face, err := fm.loadFont(fp)
+			face, err := fm.loadFont(*fp)
 			if err != nil { // very unlikely; try another family
 				fm.logger.Printf("failed loading face: %v", err)
 				continue

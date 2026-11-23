@@ -40,6 +40,14 @@ type Footprint struct {
 	// of the font among a family, like "Bold Italic"
 	Aspect font.Aspect
 
+	// coverage is the immutable, potentially shared coverage index derived
+	// from [Runes], [Scripts] and [Langs]. It is lazily attached through
+	// [Footprint.Coverage] and is not serialized: the on-disk format only
+	// stores the underlying [RuneSet], [ScriptSet] and [LangSet].
+	// It may be shared between footprints pointing at the same font identity,
+	// including fonts reached through aliased paths.
+	coverage *FontCoverageIndex
+
 	// isUserProvided is set to true for fonts add manually to
 	// a FontMap
 	// User fonts will always be tried if no other fonts match,
@@ -58,6 +66,27 @@ func newFootprintFromFont(f *font.Font, location Location, md font.Description) 
 	out.Location = location
 	out.isUserProvided = true
 	return out
+}
+
+// Coverage returns the immutable coverage index of the footprint, building
+// and registering it in the shared [CoverageIndexCache] on first use.
+// The returned pointer may be shared with other footprints describing the
+// same font identity and is safe for concurrent read-only use.
+func (fp *Footprint) Coverage() *FontCoverageIndex {
+	if fp.coverage != nil {
+		return fp.coverage
+	}
+	return attachCoverageIndex(fp)
+}
+
+// coversRune reports whether the footprint covers r, going through the
+// shared coverage index when available and falling back to the serialized
+// [RuneSet] otherwise. Invalid Unicode scalar values are never covered.
+func (fp *Footprint) coversRune(r rune) bool {
+	if idx := fp.coverage; idx != nil {
+		return idx.Contains(r)
+	}
+	return fp.Runes.Contains(r)
 }
 
 // fontPageFromOs2 returns the legacy font page of a raw OS/2 table,

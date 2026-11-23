@@ -208,6 +208,10 @@ type footprintScanner struct {
 
 	dst systemFontsIndex // accumulated footprints
 
+	// keptPaths records the paths surviving the current scan; it is used
+	// to invalidate shared coverage indexes of files that disappeared.
+	keptPaths map[string]bool
+
 	// used to reduce allocations
 	scanBuffer
 }
@@ -219,22 +223,62 @@ type scanBuffer struct {
 
 func newFootprintAccumulator(currentIndex systemFontsIndex) footprintScanner {
 	// map font files to their footprints
-	out := footprintScanner{previousIndex: make(map[string]fileFootprints, len(currentIndex))}
+	out := footprintScanner{
+		previousIndex: make(map[string]fileFootprints, len(currentIndex)),
+		keptPaths:     make(map[string]bool),
+	}
 	for _, fp := range currentIndex {
 		out.previousIndex[fp.path] = fp
 	}
 	return out
 }
 
+// pruneCoverageCache drops shared coverage indexes that no longer correspond
+// to a file present in the freshly scanned [dst]. Font identities of removed
+// files are invalidated so the bounded cache cannot retain coverage computed
+// from stale content, and its capacity remains available for live fonts.
+func (fa *footprintScanner) pruneCoverageCache() {
+	cache := sharedCoverageCache()
+	for _, previous := range fa.previousIndex {
+		if _, stillPresent := fa.keptPaths[previous.path]; stillPresent {
+			continue
+		}
+		for _, fp := range previous.footprints {
+			cache.Invalidate(fp.Location)
+		}
+	}
+}
+
 func (fa *footprintScanner) consume(path string, info os.FileInfo) error {
 	modTime := newTimeStamp(info)
+	fa.keptPaths[path] = true
 
 	// try to avoid scanning the file
 	if indexedFile, has := fa.previousIndex[path]; has && indexedFile.modTime == modTime {
 		// we already have an up to date scan of the file:
-		// skip the scan and add the current footprints
-		fa.dst = append(fa.dst, indexedFile)
+		// skip the scan and add the current footprints, reusing or creating
+		// their shared coverage indexes. Going through the cache records hits
+		// and makes aliased files converge on a single immutable index.
+		reused := indexedFile
+		cache := sharedCoverageCache()
+		for i := range reused.footprints {
+			if idx, ok := cache.Lookup(reused.footprints[i].Location); ok {
+				reused.footprints[i].coverage = idx
+			} else {
+				fa.attachCoverage(&reused.footprints[i])
+			}
+		}
+		fa.dst = append(fa.dst, reused)
 		return nil
+	}
+
+	// The file is new or modified: any coverage index built from the old
+	// content must not be served anymore. New entries are stamped below.
+	if previous, has := fa.previousIndex[path]; has {
+		cache := sharedCoverageCache()
+		for _, fp := range previous.footprints {
+			cache.Invalidate(fp.Location)
+		}
 	}
 
 	// do the actual scan
@@ -265,6 +309,10 @@ func (fa *footprintScanner) consume(path string, info os.FileInfo) error {
 		fp.Location.Index = uint16(i)
 		// TODO: for now, we do not handle variable fonts
 
+		// build and share the immutable coverage index eagerly so that the
+		// scan cost is paid once per font identity, including aliased files
+		fa.attachCoverage(&fp)
+
 		ff.footprints = append(ff.footprints, fp)
 	}
 
@@ -277,6 +325,20 @@ func (fa *footprintScanner) consume(path string, info os.FileInfo) error {
 	fa.dst = append(fa.dst, ff)
 
 	return nil
+}
+
+// attachCoverage registers the footprint coverage in the shared cache,
+// reusing an existing index when another file (for example an alias) already
+// exposed the same font identity.
+func (fa *footprintScanner) attachCoverage(fp *Footprint) {
+	cache := sharedCoverageCache()
+	if idx, ok := cache.Lookup(fp.Location); ok {
+		fp.coverage = idx
+		return
+	}
+	idx := newFontCoverageIndexFromRunes(fp.Location, fp.Runes, fp.Scripts, fp.Langs)
+	cache.Put(idx)
+	fp.coverage = idx
 }
 
 // scanFontFootprints walk through the given directories
@@ -298,5 +360,8 @@ func scanFontFootprints(logger Logger, currentIndex systemFontsIndex, dirs ...st
 			return nil, err
 		}
 	}
+	// evict coverage indexes belonging to files that no longer exist, so the
+	// bounded cache cannot retain stale font data
+	accu.pruneCoverageCache()
 	return accu.dst, nil
 }
