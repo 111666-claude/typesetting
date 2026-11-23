@@ -11,61 +11,18 @@ import (
 
 //lint:file-ignore SA4006 The code generator is not smart enough to remove unused variables.
 
-func (item *ConditionFormat1) mustParse(src []byte) {
-	_ = src[7] // early bound checking
-	item.format = binary.BigEndian.Uint16(src[0:])
-	item.AxisIndex = binary.BigEndian.Uint16(src[2:])
-	item.FilterRangeMinValue = Coord(binary.BigEndian.Uint16(src[4:]))
-	item.FilterRangeMaxValue = Coord(binary.BigEndian.Uint16(src[6:]))
-}
-
-func ParseConditionFormat1(src []byte) (ConditionFormat1, int, error) {
-	var item ConditionFormat1
-	n := 0
-	if L := len(src); L < 8 {
-		return item, 0, fmt.Errorf("reading ConditionFormat1: "+"EOF: expected length: 8, got %d", L)
-	}
-	item.mustParse(src)
-	n += 8
-	return item, n, nil
-}
-
+// ParseConditionSet parses a ConditionSet table from `src`.
+// Individual malformed condition entries are retained as invalid
+// conditions instead of rejecting the whole layout table.
 func ParseConditionSet(src []byte) (ConditionSet, int, error) {
 	var item ConditionSet
-	n := 0
 	if L := len(src); L < 2 {
 		return item, 0, fmt.Errorf("reading ConditionSet: "+"EOF: expected length: 2, got %d", L)
 	}
-	arrayLengthConditions := int(binary.BigEndian.Uint16(src[0:]))
-	n += 2
-
-	{
-
-		if L := len(src); L < 2+arrayLengthConditions*4 {
-			return item, 0, fmt.Errorf("reading ConditionSet: "+"EOF: expected length: %d, got %d", 2+arrayLengthConditions*4, L)
-		}
-
-		item.Conditions = make([]ConditionFormat1, arrayLengthConditions) // allocation guarded by the previous check
-		for i := range item.Conditions {
-			offset := int(binary.BigEndian.Uint32(src[2+i*4:]))
-			// ignore null offsets
-			if offset == 0 {
-				continue
-			}
-
-			if L := len(src); L < offset {
-				return item, 0, fmt.Errorf("reading ConditionSet: "+"EOF: expected length: %d, got %d", offset, L)
-			}
-
-			var err error
-			item.Conditions[i], _, err = ParseConditionFormat1(src[offset:])
-			if err != nil {
-				return item, 0, fmt.Errorf("reading ConditionSet: %s", err)
-			}
-		}
-		n += arrayLengthConditions * 4
+	if err := item.parseConditionSet(src); err != nil {
+		return item, 0, fmt.Errorf("reading ConditionSet: %s", err)
 	}
-	return item, n, nil
+	return item, 2 + len(item.Conditions)*4, nil
 }
 
 func ParseFeature(src []byte) (Feature, int, error) {
@@ -138,6 +95,11 @@ func ParseFeatureTableSubstitution(src []byte) (FeatureTableSubstitution, int, e
 	n += 6
 
 	{
+		// each record is 6 bytes; clamp an oversized count to avoid a huge
+		// allocation when reading a malicious font
+		if max := (len(src) - 6) / 6; arrayLengthSubstitutions > max {
+			arrayLengthSubstitutions = max
+		}
 
 		offset := 6
 		for i := 0; i < arrayLengthSubstitutions; i++ {
@@ -194,6 +156,11 @@ func ParseFeatureVariation(src []byte) (FeatureVariation, int, error) {
 	n += 8
 
 	{
+		// each record is 8 bytes; clamp an oversized count so a malicious font
+		// cannot trigger a huge allocation
+		if max := (len(src) - 8) / 8; arrayLengthFeatureVariationRecords > max {
+			arrayLengthFeatureVariationRecords = max
+		}
 
 		offset := 8
 		for i := 0; i < arrayLengthFeatureVariationRecords; i++ {

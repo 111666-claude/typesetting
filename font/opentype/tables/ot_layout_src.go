@@ -148,16 +148,170 @@ type FeatureVariationRecord struct {
 	Substitutions FeatureTableSubstitution `offsetSize:"Offset32" offsetRelativeTo:"Parent"` // Offset to a feature table substitution table, from beginning of the FeatureVariations table.
 }
 
-type ConditionSet struct {
-	// uint16	conditionCount	Number of Conditions for this condition set.
-	Conditions []ConditionFormat1 `arrayCount:"FirstUint16" offsetsArray:"Offset32"` // [conditionCount]	Array of offsets to condition tables, from beginning of the ConditionSet table.
+// Condition is the common interface implemented by the condition formats
+// used inside a [ConditionSet].
+//   - [ConditionFormat1]: axis interval condition
+//   - [ConditionFormat2]: axis value condition
+//
+// Invalid or unsupported condition tables are represented by a
+// [ConditionFormat1] with [ConditionFormat1.invalid] set to true.
+type Condition interface {
+	// Eval returns whether the normalized coordinate of the condition axis
+	// satisfies the condition.
+	eval(coords []Coord) bool
+	isCondition()
 }
 
+type ConditionSet struct {
+	// conditionCount: number of Conditions for this condition set.
+	// A null condition offset is kept as a nil entry and treated as a
+	// condition that always evaluates to true, as per the OpenType spec;
+	// a malformed condition is kept as an entry with [ConditionFormat1.invalid]
+	// set, which never evaluates to true.
+	Conditions []Condition `isOpaque:""`
+}
+
+// parseConditionSet parses a condition set from `src`, which is the bytes of
+// the ConditionSet table itself.
+// Malformed condition entries are kept as invalid conditions and never cause
+// the whole layout table to be rejected.
+func (cs *ConditionSet) parseConditionSet(src []byte) error {
+	if L := len(src); L < 2 {
+		return fmt.Errorf("reading ConditionSet: EOF: expected length: 2, got %d", L)
+	}
+	count := int(binary.BigEndian.Uint16(src[0:]))
+	// guard against an oversized count declaring more entries than the table can hold
+	if max := (len(src) - 2) / 4; count > max {
+		count = max
+	}
+	cs.Conditions = make([]Condition, count)
+	for i := 0; i < count; i++ {
+		offset := int(binary.BigEndian.Uint32(src[2+i*4:]))
+		if offset == 0 { // null offset: condition that always applies
+			continue
+		}
+		if offset > len(src) {
+			cs.Conditions[i] = ConditionFormat1{invalid: true}
+			continue
+		}
+		cs.Conditions[i] = parseCondition(src[offset:])
+	}
+	return nil
+}
+
+// parseCondition parses a single condition table, returning an invalid
+// [ConditionFormat1] instead of an error when the data is truncated or uses
+// an unknown format.
+func parseCondition(src []byte) Condition {
+	if len(src) < 2 {
+		return ConditionFormat1{invalid: true}
+	}
+	format := binary.BigEndian.Uint16(src[0:])
+	switch format {
+	case 1:
+		if len(src) < 8 {
+			return ConditionFormat1{invalid: true}
+		}
+		return ConditionFormat1{
+			format:              1,
+			AxisIndex:           binary.BigEndian.Uint16(src[2:]),
+			FilterRangeMinValue: Coord(binary.BigEndian.Uint16(src[4:])),
+			FilterRangeMaxValue: Coord(binary.BigEndian.Uint16(src[6:])),
+		}
+	case 2:
+		if len(src) < 8 {
+			return ConditionFormat1{invalid: true}
+		}
+		return ConditionFormat2{
+			format:       2,
+			AxisIndex:    binary.BigEndian.Uint16(src[2:]),
+			DefaultValue: Coord(binary.BigEndian.Uint16(src[4:])),
+			// the last two bytes are an offset (from the start of the
+			// condition) to an AxisValueTable; 0 means there is none.
+			VarIndexTableOffset: uint32(binary.BigEndian.Uint16(src[6:])),
+		}
+	default:
+		return ConditionFormat1{invalid: true}
+	}
+}
+
+// ConditionFormat1 defines an axis interval condition: it matches when the
+// normalized coordinate of axis AxisIndex lies within the (inclusive)
+// filter range.
 type ConditionFormat1 struct {
 	format              uint16 // Format, = 1
+	invalid             bool   // true when the underlying condition table is malformed
 	AxisIndex           uint16 // Index (zero-based) for the variation axis within the 'fvar' table.
 	FilterRangeMinValue Coord  // Minimum value of the font variation instances that satisfy this condition.
 	FilterRangeMaxValue Coord  // Maximum value of the font variation instances that satisfy this condition.
+}
+
+func (ConditionFormat1) isCondition() {}
+
+// Eval reports whether `coords` satisfy the axis interval condition.
+// An invalid condition never matches. An axis index outside the provided
+// coordinates is read as 0 (the default normalized coordinate).
+func (c ConditionFormat1) Eval(coords []Coord) bool { return c.eval(coords) }
+
+func (c ConditionFormat1) eval(coords []Coord) bool {
+	if c.invalid {
+		return false
+	}
+	coord := conditionAxisCoord(c.AxisIndex, coords)
+	return c.FilterRangeMinValue <= coord && coord <= c.FilterRangeMaxValue
+}
+
+// ConditionFormat2 defines an axis value condition. It matches when the
+// normalized coordinate of axis AxisIndex equals the value derived from the
+// default value and the referenced AxisValueTable (if any); with no axis
+// value table, the condition matches when the coordinate equals DefaultValue.
+type ConditionFormat2 struct {
+	format              uint16 // Format, = 2
+	AxisIndex           uint16 // Index (zero-based) for the variation axis within the 'fvar' table.
+	DefaultValue        Coord  // Coordinate value used when no AxisValueTable is provided.
+	VarIndexTableOffset uint32 // Offset (from the start of the condition) to an AxisValueTable; 0 if none.
+}
+
+func (ConditionFormat2) isCondition() {}
+
+// Eval reports whether `coords` satisfy the axis value condition.
+// AxisValueTable resolution (which requires 'fvar'/'avar' context) is not
+// available at this layer, so a condition referencing one conservatively does
+// not match; without an axis value table the condition matches when the axis
+// coordinate equals DefaultValue.
+func (c ConditionFormat2) Eval(coords []Coord) bool { return c.eval(coords) }
+
+func (c ConditionFormat2) eval(coords []Coord) bool {
+	if c.VarIndexTableOffset != 0 {
+		// an axis value table cannot be resolved without the font variation
+		// tables: skip the condition rather than match on wrong data
+		return false
+	}
+	return conditionAxisCoord(c.AxisIndex, coords) == c.DefaultValue
+}
+
+// conditionAxisCoord returns the normalized coordinate for the axis,
+// defaulting to 0 (the default instance) when the index is not provided.
+func conditionAxisCoord(axisIndex uint16, coords []Coord) Coord {
+	if int(axisIndex) < len(coords) {
+		return coords[axisIndex]
+	}
+	return 0
+}
+
+// Eval reports whether every condition of the set is satisfied.
+// A condition set without any condition always matches, and a null
+// condition entry is treated as a condition that always matches.
+func (cs ConditionSet) Eval(coords []Coord) bool {
+	for _, c := range cs.Conditions {
+		if c == nil { // null condition offset: always true
+			continue
+		}
+		if !c.eval(coords) {
+			return false
+		}
+	}
+	return true
 }
 
 type FeatureTableSubstitution struct {

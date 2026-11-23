@@ -319,7 +319,7 @@ func getRequiredFeature(g *font.Layout, scriptIndex, languageIndex int) (uint16,
 // the given table, enabled at the specified variations index.
 // it returns the basic feature if `variationsIndex == noVariationsIndex`
 func getFeatureLookupsWithVar(table *font.Layout, featureIndex uint16, variationsIndex int) []uint16 {
-	if featureIndex == NoFeatureIndex {
+	if featureIndex == NoFeatureIndex || int(featureIndex) >= len(table.Features) {
 		return nil
 	}
 
@@ -327,14 +327,19 @@ func getFeatureLookupsWithVar(table *font.Layout, featureIndex uint16, variation
 		return table.Features[featureIndex].LookupListIndices
 	}
 
-	// hook the variations
+	if variationsIndex < 0 || variationsIndex >= len(table.FeatureVariations) {
+		return table.Features[featureIndex].LookupListIndices
+	}
+
+	// hook the variations: the OpenType spec requires the default feature to
+	// be used when the matched record does not substitute the feature
 	subs := table.FeatureVariations[variationsIndex].Substitutions.Substitutions
 	for _, sub := range subs {
 		if sub.FeatureIndex == featureIndex {
 			return sub.AlternateFeature.LookupListIndices
 		}
 	}
-	return nil
+	return table.Features[featureIndex].LookupListIndices
 }
 
 // tests whether a specified lookup index in the specified face would

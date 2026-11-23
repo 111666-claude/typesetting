@@ -77,38 +77,6 @@ func (la *Layout) FindScript(script Tag) int {
 	return -1
 }
 
-// FindVariationIndex returns the first feature variation matching
-// the specified variation coordinates, as an index in the
-// `FeatureVariations` field.
-// It returns `-1` if not found.
-func (la *Layout) FindVariationIndex(coords []VarCoord) int {
-	for i, record := range la.FeatureVariations {
-		if evaluateVarRec(record, coords) {
-			return i
-		}
-	}
-	return -1
-}
-
-// returns `true` if the feature is concerned by the `coords`
-func evaluateVarRec(fv tables.FeatureVariationRecord, coords []VarCoord) bool {
-	for _, c := range fv.ConditionSet.Conditions {
-		if !evaluateCondition(c, coords) {
-			return false
-		}
-	}
-	return true
-}
-
-// returns `true` if `coords` match the condition `c`
-func evaluateCondition(c tables.ConditionFormat1, coords []VarCoord) bool {
-	var coord VarCoord
-	if int(c.AxisIndex) < len(coords) {
-		coord = coords[c.AxisIndex]
-	}
-	return c.FilterRangeMinValue <= coord && coord <= c.FilterRangeMaxValue
-}
-
 // FindFeatureIndex fetches the index for a given feature tag in the GSUB or GPOS table.
 // Returns false if not found
 func (la *Layout) FindFeatureIndex(featureTag Tag) (uint16, bool) {
