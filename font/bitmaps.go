@@ -439,9 +439,12 @@ func parseBitmapDataMetrics(imageData []byte, start, end tables.Offset32, imageF
 	}
 	imageData = imageData[start:end]
 	switch imageFormat {
-	case 6, 7, 8, 9:
-		return bitmapImage{}, fmt.Errorf("valid but currently not implemented bitmap image format: %d", imageFormat)
 	case 1, 2:
+		data, _, err := tables.ParseBitmapData1Or2(imageData)
+		return bitmapImage{metrics: data.SmallGlyphMetrics, image: data.Image}, err
+	// formats 6, 7 and 8 share the small metrics header of formats 1 and 2,
+	// followed respectively by 8-bit grayscale and 32-bit BGRA image data.
+	case 6, 7, 8:
 		data, _, err := tables.ParseBitmapData1Or2(imageData)
 		return bitmapImage{metrics: data.SmallGlyphMetrics, image: data.Image}, err
 	case 17:
@@ -464,6 +467,11 @@ func parseBitmapDataStandalone(imageData []byte, start, end uint32, format uint1
 	case 4:
 		return nil, fmt.Errorf("valid but currently not implemented bitmap image format: %d", format)
 	case 5:
+		data, _, err := tables.ParseBitmapData5(imageData)
+		return data.Image, err
+	// formats 7 and 9 are data-only 8-bit grayscale and 32-bit BGRA,
+	// sharing the layout of format 5 (metrics live in the index subtable)
+	case 7, 9:
 		data, _, err := tables.ParseBitmapData5(imageData)
 		return data.Image, err
 	case 19:

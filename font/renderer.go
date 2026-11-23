@@ -5,6 +5,7 @@ package font
 import (
 	"errors"
 	"fmt"
+	"image"
 
 	ot "github.com/go-text/typesetting/font/opentype"
 	"github.com/go-text/typesetting/font/opentype/tables"
@@ -82,6 +83,17 @@ type GlyphBitmap struct {
 	Format        BitmapFormat
 	Width, Height int // number of columns and rows
 
+	// BearingX is the horizontal distance from the glyph origin to the
+	// left edge of the bitmap, in pixels. It is typically positive.
+	//
+	// BearingY is the vertical distance from the glyph origin (the
+	// baseline) to the top edge of the bitmap, in pixels. It is typically
+	// positive for bitmaps lying above the baseline.
+	//
+	// [DecodeGlyphBitmap] uses these values to position the decoded image
+	// so that its bounds encode the glyph origin.
+	BearingX, BearingY int
+
 	// Outline may be specified to be drawn with bitmap
 	Outline *GlyphOutline
 }
@@ -106,6 +118,14 @@ const (
 	// BlackAndWhiteBitAligned is the same as [BlackAndWhite], but
 	// each row is padded to a byte boundary.
 	BlackAndWhiteByteAligned
+	// Gray stores an 8-bit per pixel grayscale (coverage) bitmap, one
+	// byte per pixel, with rows padded to a byte boundary. It is used by
+	// EBDT/CBDT image formats 6 and 7.
+	Gray
+	// BGRA stores a 32-bit per pixel color bitmap in blue, green, red,
+	// alpha order with one byte per channel. It is used by EBDT/CBDT
+	// image formats 8 and 9.
+	BGRA
 )
 
 // BitmapSize expose the size of bitmap glyphs.
@@ -132,9 +152,19 @@ func (sb sbix) glyphData(gid gID, xPpem, yPpem uint16) (GlyphBitmap, error) {
 		return GlyphBitmap{}, fmt.Errorf("no glyph %d in 'sbix' table for resolution (%d, %d)", gid, xPpem, yPpem)
 	}
 
-	out := GlyphBitmap{Data: glyph.Data}
+	out := GlyphBitmap{
+		// For sbix, OriginOffsetX is the left edge of the bitmap and
+		// OriginOffsetY is the bottom edge, relative to the glyph origin.
+		BearingX: int(glyph.OriginOffsetX),
+		BearingY: int(glyph.OriginOffsetY),
+	}
 	var err error
 	out.Width, out.Height, out.Format, err = decodeBitmapConfig(glyph)
+	if err == nil {
+		// the bearing points at the top edge
+		out.BearingY += out.Height
+	}
+	out.Data = glyph.Data
 
 	return out, err
 }
@@ -156,9 +186,11 @@ func (bt bitmap) glyphData(gid gID, xPpem, yPpem uint16) (GlyphBitmap, error) {
 	}
 
 	out := GlyphBitmap{
-		Data:   glyph.image,
-		Width:  int(glyph.metrics.Width),
-		Height: int(glyph.metrics.Height),
+		Data:     glyph.image,
+		Width:    int(glyph.metrics.Width),
+		Height:   int(glyph.metrics.Height),
+		BearingX: int(glyph.metrics.BearingX),
+		BearingY: int(glyph.metrics.BearingY),
 	}
 	switch subtable.imageFormat {
 	case 17, 18, 19: // PNG
@@ -176,6 +208,16 @@ func (bt bitmap) glyphData(gid gID, xPpem, yPpem uint16) (GlyphBitmap, error) {
 		L := out.Width * out.Height // in bits
 		if len(out.Data)*8 < L {
 			return GlyphBitmap{}, fmt.Errorf("EOF in glyph bitmap: expected %d, got %d", L, len(out.Data)*8)
+		}
+	case 6, 7: // 8-bit grayscale, byte aligned rows
+		out.Format = Gray
+		if exp := out.Width * out.Height; len(out.Data) < exp {
+			return GlyphBitmap{}, fmt.Errorf("EOF in glyph bitmap: expected %d, got %d", exp, len(out.Data))
+		}
+	case 8, 9: // 32-bit BGRA color
+		out.Format = BGRA
+		if exp := out.Width * out.Height * 4; len(out.Data) < exp {
+			return GlyphBitmap{}, fmt.Errorf("EOF in glyph bitmap: expected %d, got %d", exp, len(out.Data))
 		}
 	default:
 		return GlyphBitmap{}, fmt.Errorf("unsupported format %d in bitmap table", subtable.imageFormat)
@@ -486,4 +528,35 @@ func (f *Face) GlyphDataBitmap(gid GID) (GlyphBitmap, bool) {
 	}
 
 	return GlyphBitmap{}, false
+}
+
+// GlyphBitmapImage is the unified bitmap glyph decoding entry point.
+//
+// It looks for a bitmap glyph for [gid] in the 'sbix', 'CBDT', 'EBDT' and
+// 'BDAT' tables, selecting the strike best matching the face current ppem
+// (see [Face.SetPpem]), and decodes it into an [image.Image] positioned at
+// the glyph origin: the returned image bounds Min point is
+// (BearingX, -BearingY), so it can be drawn directly at the pen position.
+//
+// Black and white, grayscale, PNG, JPEG and TIFF payloads are all handled,
+// see [DecodeGlyphBitmap] for the decoding details.
+//
+// The boolean is false when the font has no bitmap for [gid] at the current
+// resolution; callers should then fall back to [Face.GlyphDataOutline].
+// A non-nil error means a bitmap was found but could not be decoded
+// (truncated or unsupported encoding, exceeded resource limit): the raw
+// data remains available through [Face.GlyphDataBitmap].
+//
+// The method is read-only and safe to call repeatedly; each call returns a
+// freshly allocated image and never panics on malformed font data.
+func (f *Face) GlyphBitmapImage(gid GID) (image.Image, bool, error) {
+	bm, ok := f.GlyphDataBitmap(gid)
+	if !ok {
+		return nil, false, nil
+	}
+	img, err := DecodeGlyphBitmap(bm)
+	if err != nil {
+		return nil, true, err
+	}
+	return img, true, nil
 }
