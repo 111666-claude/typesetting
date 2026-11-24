@@ -240,11 +240,11 @@ func Test_refreshSystemFontsIndex(t *testing.T) {
 	cachePath := filepath.Join(dir, "fonts.cache")
 
 	logger := log.New(io.Discard, "", 0)
-	_, err := refreshSystemFontsIndex(logger, cachePath)
+	_, err := refreshSystemFontsIndex(logger, cachePath, "")
 	tu.AssertNoErr(t, err)
 
 	ti := time.Now()
-	_, err = refreshSystemFontsIndex(logger, cachePath)
+	_, err = refreshSystemFontsIndex(logger, cachePath, "")
 	tu.AssertNoErr(t, err)
 
 	fmt.Printf("cache refresh in %s\n", time.Since(ti))

@@ -193,6 +193,18 @@ func (sfi systemFontsIndex) assertValid() error {
 	return errors.New("no valid font")
 }
 
+// ScanStats reports how a scan reused the reference index. It is mainly useful
+// in tests to verify incremental snapshot behavior.
+type ScanStats struct {
+	// Scanned is the number of files actually opened and parsed, either
+	// because they were unknown to the reference index or because their
+	// size or modification time had changed.
+	Scanned int
+	// Reused is the number of entries copied verbatim from the reference
+	// index, without touching the font file.
+	Reused int
+}
+
 // groups the footprints by origin file
 type fileFootprints struct {
 	path string // file path
@@ -201,6 +213,12 @@ type fileFootprints struct {
 
 	// modification time for the file
 	modTime timeStamp
+
+	// size is the file size in bytes, used together with modTime to detect
+	// changes. It is negative for entries converted from the legacy cache
+	// format, which did not record a size, in which case only modTime is
+	// compared.
+	size int64
 }
 
 type footprintScanner struct {
@@ -210,6 +228,8 @@ type footprintScanner struct {
 
 	// used to reduce allocations
 	scanBuffer
+
+	stats ScanStats
 }
 
 type scanBuffer struct {
@@ -228,25 +248,43 @@ func newFootprintAccumulator(currentIndex systemFontsIndex) footprintScanner {
 
 func (fa *footprintScanner) consume(path string, info os.FileInfo) error {
 	modTime := newTimeStamp(info)
+	size := info.Size()
 
-	// try to avoid scanning the file
+	// try to avoid scanning the file: the modification time always has to
+	// match, and so does the size once it is known. Entries loaded from the
+	// legacy cache have an unknown size, in which case the modification time
+	// alone is authoritative, but the current size is filled in so the saved
+	// snapshot gains size based invalidation without rescanning the font.
 	if indexedFile, has := fa.previousIndex[path]; has && indexedFile.modTime == modTime {
-		// we already have an up to date scan of the file:
-		// skip the scan and add the current footprints
-		fa.dst = append(fa.dst, indexedFile)
-		return nil
+		switch {
+		case indexedFile.size == snapshotUnknownSize:
+			indexedFile.size = size
+			fa.dst = append(fa.dst, indexedFile)
+			fa.stats.Reused++
+			return nil
+		case indexedFile.size == size:
+			// we already have an up to date scan of the file:
+			// skip the scan and add the current footprints
+			fa.dst = append(fa.dst, indexedFile)
+			fa.stats.Reused++
+			return nil
+		}
 	}
 
 	// do the actual scan
+	fa.stats.Scanned++
 
 	file, err := os.Open(path)
 	if err != nil {
-		return err
+		// Surface the offending path so callers can distinguish a permission
+		// problem on one font from a broken directory traversal.
+		return fmt.Errorf("opening font file %q: %w", path, err)
 	}
 
 	ff := fileFootprints{
 		path:    path,
 		modTime: modTime,
+		size:    size,
 	}
 
 	// fetch the loaders for the given font file, or nil if is not
@@ -287,6 +325,13 @@ func (fa *footprintScanner) consume(path string, info os.FileInfo) error {
 // already present in `currentIndex` and up to date, and directly duplicating
 // the footprint in `currentIndex`
 func scanFontFootprints(logger Logger, currentIndex systemFontsIndex, dirs ...string) (systemFontsIndex, error) {
+	index, _, err := scanFontFootprintsStats(logger, currentIndex, dirs...)
+	return index, err
+}
+
+// scanFontFootprintsStats is [scanFontFootprints], additionally returning the
+// number of entries reused from the reference index versus rescanned.
+func scanFontFootprintsStats(logger Logger, currentIndex systemFontsIndex, dirs ...string) (systemFontsIndex, ScanStats, error) {
 	// visited records file paths already scanned, so overlapping directories
 	// do not add a file twice. The walk does not resolve symlinks.
 	visited := make(map[string]bool)
@@ -295,8 +340,8 @@ func scanFontFootprints(logger Logger, currentIndex systemFontsIndex, dirs ...st
 	for _, dir := range dirs {
 		err := accu.scanDirectory(logger, dir, visited)
 		if err != nil {
-			return nil, err
+			return nil, ScanStats{}, fmt.Errorf("scanning font directory %q: %w", dir, err)
 		}
 	}
-	return accu.dst, nil
+	return accu.dst, accu.stats, nil
 }

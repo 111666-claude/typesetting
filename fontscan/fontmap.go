@@ -188,7 +188,15 @@ func cacheDir(userProvided string) (string, error) {
 // It is protected by sync.Once, and is then safe to use by multiple goroutines.
 func initSystemFonts(logger Logger, userCacheDir string) error {
 	initSystemFontsOnce.Do(func() {
-		const cacheFilePattern = "font_index_v%d.cache"
+		const (
+			// cacheFilePattern names the versioned snapshot written by current
+			// builds.
+			cacheFilePattern = "font_index_snapshot_v%d.cache"
+			// legacyCacheFilePattern names the unversioned gzip index written
+			// by previous releases; it is still read once when no snapshot
+			// exists, so existing caches keep warming the first launch.
+			legacyCacheFilePattern = "font_index_v%d.cache"
+		)
 
 		// load an existing index
 		var dir string
@@ -197,29 +205,38 @@ func initSystemFonts(logger Logger, userCacheDir string) error {
 			return
 		}
 
-		cachePath := filepath.Join(dir, fmt.Sprintf(cacheFilePattern, cacheFormatVersion))
+		cachePath := filepath.Join(dir, fmt.Sprintf(cacheFilePattern, snapshotFormatVersion))
+		legacyCachePath := filepath.Join(dir, fmt.Sprintf(legacyCacheFilePattern, cacheFormatVersion))
 
-		systemFonts, systemFontsErr = refreshSystemFontsIndex(logger, cachePath)
+		systemFonts, systemFontsErr = refreshSystemFontsIndex(logger, cachePath, legacyCachePath)
 	})
 
 	return systemFontsErr
 }
 
-func refreshSystemFontsIndex(logger Logger, cachePath string) (systemFontsIndex, error) {
+func refreshSystemFontsIndex(logger Logger, cachePath, legacyCachePath string) (systemFontsIndex, error) {
 	fontDirectories, err := DefaultFontDirectories(logger)
 	if err != nil {
 		return nil, fmt.Errorf("searching font directories: %s", err)
 	}
 	logger.Printf("using system font dirs %q", fontDirectories)
 
-	currentIndex, err := deserializeIndexFile(cachePath)
-	if err != nil && !errors.Is(err, fs.ErrNotExist) {
-		// The cache file is missing on first run. Any other error means the
-		// cache is corrupt, and the scan starts from scratch.
-		logger.Printf("ignoring invalid font index cache %q: %v", cachePath, err)
+	var currentIndex systemFontsIndex
+	snap, err := LoadFontScanSnapshot(logger, cachePath, legacyCachePath)
+	switch {
+	case err == nil:
+		currentIndex = snap.toSystemFontsIndex()
+	case errors.Is(err, fs.ErrNotExist):
+		// The cache file is missing on first run: start from an empty index.
+	default:
+		// Truncation, checksum mismatch, bad magic, duplicate entries and so
+		// on: the corrupt snapshot is ignored and the scan starts from
+		// scratch. The invalid file itself is left untouched until a full
+		// scan produces a valid replacement.
+		logger.Printf("ignoring invalid font scan snapshot %q: %v", cachePath, err)
 	}
 
-	updatedIndex, err := scanFontFootprints(logger, currentIndex, fontDirectories...)
+	updatedIndex, _, err := scanFontFootprintsStats(logger, currentIndex, fontDirectories...)
 	if err != nil {
 		return nil, fmt.Errorf("scanning system fonts: %s", err)
 	}
@@ -232,13 +249,22 @@ func refreshSystemFontsIndex(logger Logger, cachePath string) (systemFontsIndex,
 		return nil, fmt.Errorf("loading system fonts: %s", err)
 	}
 
-	// write back the index in the cache file
-	err = updatedIndex.serializeToFile(cachePath)
-	if err != nil {
+	// atomically write back the snapshot, replacing any corrupt previous file
+	if err := saveSystemFontsSnapshot(updatedIndex, cachePath); err != nil {
 		return nil, fmt.Errorf("updating cache: %s", err)
 	}
 
 	return updatedIndex, nil
+}
+
+// saveSystemFontsSnapshot converts an index into a validated snapshot and
+// writes it atomically.
+func saveSystemFontsSnapshot(index systemFontsIndex, cachePath string) error {
+	snap, err := NewFontScanSnapshot(snapshotEntriesFromIndex(index))
+	if err != nil {
+		return err
+	}
+	return snap.Save(cachePath)
 }
 
 // [AddFont] loads the faces contained in [fontFile] and add them to

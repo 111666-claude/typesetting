@@ -9,7 +9,6 @@ import (
 	"io"
 	"math"
 	"os"
-	"path/filepath"
 
 	"github.com/go-text/typesetting/font"
 )
@@ -272,24 +271,18 @@ func deserializeIndexFile(cachePath string) (systemFontsIndex, error) {
 	defer f.Close()
 
 	out, err := deserializeIndex(f)
-	return out, err
+	if err != nil {
+		return nil, err
+	}
+	// the legacy format never recorded file sizes: mark them explicitly so
+	// the snapshot conversion validates such entries by modification time only
+	for i := range out {
+		out[i].size = snapshotUnknownSize
+	}
+	return out, nil
 }
 
-func (index systemFontsIndex) serializeToFile(cachePath string) error {
-	dir, _ := filepath.Split(cachePath)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return fmt.Errorf("unable to create system font cache dir %q: %w", dir, err)
-	}
-	f, err := os.Create(cachePath)
-	if err != nil {
-		return err
-	}
-
-	err = index.serializeTo(f)
-	if err != nil {
-		return err
-	}
-
-	err = f.Close()
-	return err
-}
+// Note: the legacy on-disk index is read-only now. Current releases persist
+// the index through [FontScanSnapshot] (see snapshot.go), which adds magic,
+// version and checksum framing; the serializers above are retained both for
+// the legacy cache conversion path and their in-memory test coverage.

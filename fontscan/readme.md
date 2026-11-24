@@ -64,3 +64,15 @@ which are lightweight enough to be loaded and queried efficiently.
 The initial scan required to build this index has a significant latency (say between 0.2 and 0.5 sec on a laptop).
 Once the first scan has been done, however, the subsequent launches are fast : at the first call of `UseSystemFonts`, the index is loaded from an on-disk cache, and its integrity is checked against the
 current file system state to detect font installation or suppression.
+
+### On-disk snapshot
+
+The on-disk cache is a versioned `FontScanSnapshot`. Each file entry records the font path, its size and modification time, and the per-face `Footprint` data (location, family, aspect, rune, script and language coverage). The binary framing is self describing:
+
+- a fixed header carries a `"FTSN"` magic number, a format version, a gzip compression flag, the payload length and an IEEE CRC-32 checksum of the payload;
+- the payload is a sequence of tag/length/value records, so a reader can skip records and entry fields introduced by a newer version instead of failing;
+- paths are stored with slash separators and modification times as Unix nanoseconds, which makes the representation independent from the host path separator and time zone, and entries are sorted by path so the encoding is deterministic.
+
+Loading is incremental: entries whose size and modification time match the current file state are reused without opening the font file, while added, removed or changed files are rescanned. Saves are atomic (write to a temporary file in the same directory, then rename), so a crash, a short write or a permission error never replaces the previous snapshot, and truncation, checksum failures, duplicate records and oversized inputs are rejected with an error wrapping the offending path. Snapshot values are immutable after loading and may be read concurrently without locking.
+
+Caches written by older releases (`font_index_v8.cache`, a gzip stream without magic or checksum) remain readable: when no versioned snapshot exists, the legacy index is loaded once and converted in memory. Its entries have no recorded size, so they fall back to modification-time-only validation until the next scan writes them back in the snapshot format.
