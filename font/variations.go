@@ -541,6 +541,13 @@ type Variation struct {
 // SetVariations applies a list of font-variation settings to a font,
 // defaulting to the values given in the `fvar` table.
 // Note that passing an empty slice will instead remove the coordinates.
+//
+// This method keeps the historical lenient semantics: unknown axis tags
+// are ignored, a value set for a tag shared by several axes is applied to
+// every matching axis, repeated settings resolve to the last value and
+// out of range values are clamped during normalization. The stricter
+// [Font.NewVariationPlan] API rejects unknown, duplicated and non-finite
+// settings instead.
 func (face *Face) SetVariations(variations []Variation) {
 	if len(variations) == 0 {
 		face.SetCoords(nil)
@@ -623,12 +630,5 @@ func (f *Font) NormalizeVariations(coords []float32) []VarCoord {
 	// Axis normalization is a two-stage process.  First we normalize
 	// based on the [min,def,max] values for the axis to be [-1,0,1].
 	// Then, if there's an `avar' table, we renormalize this range.
-	normalized := f.fvar.normalizeCoordinates(coords)
-
-	// now applying 'avar'
-	for i, av := range f.avar.AxisSegmentMaps {
-		normalized[i] = av.Map(normalized[i])
-	}
-
-	return normalized
+	return f.normalizeDesign(coords)
 }

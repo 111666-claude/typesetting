@@ -169,12 +169,13 @@ type Font struct {
 
 	// Optional, only present in variable fonts
 
-	fvar fvar         // optional
-	hvar *tables.HVAR // optional
-	vvar *tables.VVAR // optional
-	avar tables.Avar
-	mvar mvar
-	gvar gvar
+	fvar          fvar            // optional
+	fvarInstances []NamedInstance // optional, named instances from 'fvar'
+	hvar          *tables.HVAR    // optional
+	vvar          *tables.VVAR    // optional
+	avar          tables.Avar
+	mvar          mvar
+	gvar          gvar
 
 	// Advanced layout tables.
 
@@ -245,8 +246,8 @@ func NewFont(ld *ot.Loader) (*Font, error) {
 	// which in turn will return a zero value
 
 	raw, _ = ld.RawTable(ot.MustNewTag("fvar"))
-	fvar, _, _ := tables.ParseFvar(raw)
-	out.fvar = newFvar(fvar)
+	fvarTable, _, _ := tables.ParseFvar(raw)
+	out.fvar = newFvar(fvarTable)
 
 	raw, _ = ld.RawTable(ot.MustNewTag("avar"))
 	avar, _, err := tables.ParseAvar(raw)
@@ -335,6 +336,9 @@ func NewFont(ld *ot.Loader) (*Font, error) {
 
 	raw, _ = ld.RawTable(ot.MustNewTag("name"))
 	out.names, _, _ = tables.ParseName(raw)
+
+	// Resolve the 'fvar' named instances once the 'name' table is available.
+	out.fvarInstances = newNamedInstances(fvarTable.FvarRecords.Instances, out.fvar, out.names)
 
 	// layout tables
 
